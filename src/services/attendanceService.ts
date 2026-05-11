@@ -1,0 +1,244 @@
+import { cosineSimilarity } from '../utils/cosineSimilarity';
+import Logger from '../utils/Logger';
+import { getAllEmployees, Employee } from '../database/employeeRepo';
+import {
+    buildClusterIndex,
+    findNearestClusters,
+    ClusterIndex,
+    computeEmployeeHash,
+} from '../utils/embeddingCluster';
+import { saveClusterIndex, loadClusterIndex } from '../database/clusterRepo';
+
+// ─── Recognition constants ───────────────
+
+const SIMILARITY_THRESHOLD = 0.75;   // ✅ was 0.78 — catches valid matches being missed
+const EARLY_EXIT_THRESHOLD = 0.95;
+const CACHE_TTL_MS = 30000;          // 30 seconds
+const CURRENT_MODEL_VERSION = 'v1';  // ✅ M2: Tracks embedding model version
+
+// ✅ NEW — replaces fixed MARGIN_THRESHOLD = 0.10
+const getDynamicMargin = (employeeCount: number): number => {
+    if (employeeCount <= 10) return 0.03;  // 5 employees → margin 0.03 (your case)
+    if (employeeCount <= 30) return 0.05;
+    if (employeeCount <= 100) return 0.07;
+    return 0.10;                            // 100+ employees → original strict margin
+};
+// ─────────────────────────────────────────────────────
+// In-memory state
+// ─────────────────────────────────────────────────────
+let employeeCache: Employee[] | null = null;
+let clusterIndex: ClusterIndex | null = null;
+let employeeMap: Map<string, Employee> = new Map();
+let cacheLoadedAt: number = 0;
+
+export const invalidateEmployeeCache = (): void => {
+    employeeCache = null;
+    clusterIndex = null;
+    employeeMap.clear();
+    cacheLoadedAt = 0;
+    Logger.debug('attendanceService', 'Cache + cluster index invalidated');
+};
+
+// ─────────────────────────────────────────────────────
+// Load employees + build cluster index
+// ─────────────────────────────────────────────────────
+const initializeIndex = async (): Promise<void> => {
+    const now = Date.now();
+    if (employeeCache && clusterIndex && (now - cacheLoadedAt) < CACHE_TTL_MS) return;
+
+    try {
+        Logger.debug('attendanceService', 'Building search index...');
+        const t0 = Date.now();
+
+        const employees = await getAllEmployees();
+        employeeCache = employees;
+
+        // 🔎 DEBUG: Show DB embedding sample
+        Logger.debug('MATCH', `Employee embeddings sample:`);
+        if (employees.length > 0) {
+            const sample = employees[0];
+            const emb = Array.isArray(sample.embedding[0])
+                ? (sample.embedding as unknown as number[][])[0]
+                : sample.embedding as number[];
+            const norm = Math.sqrt(emb.reduce((s: number, x: number) => s + x * x, 0));
+            Logger.debug('MATCH', `  ${sample.name}: embLen=${emb.length} norm=${norm.toFixed(4)}`);
+        }
+
+        employeeMap.clear();
+        for (const emp of employees) {
+            employeeMap.set(emp.emp_id, emp);
+        }
+
+        if (employees.length === 0) {
+            clusterIndex = { centroids: [], builtAt: now, empCount: 0, empHash: '' };
+            cacheLoadedAt = now;
+            return;
+        }
+
+        // ✅ H1 FIX: Use content hash instead of count to detect employee swap
+        const currentHash = computeEmployeeHash(employees);
+
+        const saved = loadClusterIndex();
+        if (
+            saved &&
+            saved.empHash === currentHash &&
+            (now - saved.builtAt) < 5 * 60 * 1000
+        ) {
+            clusterIndex = saved;
+            cacheLoadedAt = now;
+            Logger.debug('attendanceService', `Reused saved cluster index in ${Date.now() - t0}ms`);
+            return;
+        }
+
+        const index = buildClusterIndex(
+            employees.map(e => ({
+                emp_id: e.emp_id,
+                embedding: Array.isArray(e.embedding[0])
+                    ? (e.embedding as unknown as number[][])[0]
+                    : e.embedding as number[],
+            }))
+        );
+
+        clusterIndex = index;
+        cacheLoadedAt = now;
+
+        saveClusterIndex(index);
+
+        Logger.debug('attendanceService', `Index built in ${Date.now() - t0}ms`
+            + ` (${employees.length} employees, ${index.centroids.length} clusters)`);
+
+    } catch (err) {
+        Logger.error('attendanceService', 'Index build failed:', err);
+        employeeCache = employeeCache ?? [];
+        clusterIndex = clusterIndex ?? { centroids: [], builtAt: 0, empCount: 0, empHash: '' };
+    }
+};
+
+// ─────────────────────────────────────────────────────
+// Matching
+// ─────────────────────────────────────────────────────
+export type MatchResult = {
+    name: string;
+    id: string;
+    score: number;
+    margin: number;
+};
+
+export const processMultiAttendance = async (
+    embeddings: number[][]
+): Promise<MatchResult[]> => {
+
+    await initializeIndex();
+
+    if (!employeeCache || employeeCache.length === 0 || embeddings.length === 0) {
+        return [];
+    }
+
+    // ✅ Dynamic margin based on actual employee count
+    const effectiveMargin = getDynamicMargin(employeeCache.length);
+    Logger.debug('MATCH', `Using margin=${effectiveMargin} for ${employeeCache.length} employees`);
+
+    const matchedResults: MatchResult[] = [];
+
+    for (let faceEmbedding of embeddings) {
+        // ✅ Embeddings from getEmbedding() are already L2-normalized (Java + JS)
+        //    No need for redundant l2Normalize() here
+        const normalizedLive = faceEmbedding;
+
+        let bestScore = 0;
+        let bestEmp: Employee | null = null;
+        let secondScore = 0;
+
+        const t0 = Date.now();
+
+        if (clusterIndex && clusterIndex.centroids.length > 1) {
+            const nearestClusters = findNearestClusters(clusterIndex, normalizedLive, 2);
+            const candidateIds = new Set<string>();
+            for (const cluster of nearestClusters) {
+                for (const id of cluster.memberIds) candidateIds.add(id);
+            }
+
+            Logger.debug('attendanceService', `Checking ${candidateIds.size}/${employeeCache.length} candidates`);
+
+            for (const empId of candidateIds) {
+                const emp = employeeMap.get(empId);
+                if (!emp) continue;
+
+                const storedEmbeddings: number[][] = Array.isArray(emp.embedding[0])
+                    ? (emp.embedding as unknown as number[][])
+                    : [emp.embedding as number[]];
+
+                let empBestScore = 0;
+                for (const storedEmb of storedEmbeddings) {
+                    // ✅ C4 FIX: preNormalized: true — embeddings are L2-normalized before entry into both paths
+                    const score = cosineSimilarity(normalizedLive, storedEmb, true);
+                    if (score !== null && score > empBestScore) empBestScore = score;
+                }
+
+                if (empBestScore > bestScore) {
+                    secondScore = bestScore;
+                    bestScore = empBestScore;
+                    bestEmp = emp;
+                } else if (empBestScore > secondScore) {
+                    secondScore = empBestScore;
+                }
+
+                if (bestScore >= EARLY_EXIT_THRESHOLD &&
+                    bestScore - secondScore >= effectiveMargin) break;
+            }
+
+        } else {
+            for (const emp of employeeCache) {
+                const storedEmbeddings: number[][] = Array.isArray(emp.embedding[0])
+                    ? (emp.embedding as unknown as number[][])
+                    : [emp.embedding as number[]];
+
+                let empBestScore = 0;
+                for (const storedEmb of storedEmbeddings) {
+                    // ✅ C4 FIX: preNormalized: true — embeddings are L2-normalized before entry into both paths
+                    const score = cosineSimilarity(normalizedLive, storedEmb, true);
+                    if (score !== null && score > empBestScore) empBestScore = score;
+                }
+
+                if (empBestScore > bestScore) {
+                    secondScore = bestScore;
+                    bestScore = empBestScore;
+                    bestEmp = emp;
+                } else if (empBestScore > secondScore) {
+                    secondScore = empBestScore;
+                }
+
+                if (bestScore >= EARLY_EXIT_THRESHOLD &&
+                    bestScore - secondScore >= effectiveMargin) break;
+            }
+        }
+
+        const margin = bestScore - secondScore;
+        const searchMs = Date.now() - t0;
+
+        Logger.debug('MATCH', `── Frame scan ──`);
+        Logger.debug('MATCH', `Employees in cache: ${employeeCache?.length ?? 0}`);
+        Logger.debug('MATCH', `Best score: ${bestScore.toFixed(4)} vs ${SIMILARITY_THRESHOLD}`);
+        Logger.debug('MATCH', `Margin: ${margin.toFixed(4)} vs ${effectiveMargin} (dynamic)`);
+        Logger.debug('MATCH', `Best candidate: ${bestEmp?.name ?? 'NONE'}`);
+        Logger.debug('BIOMETRIC', `Best: ${bestEmp?.name ?? 'none'}`
+            + ` score=${bestScore.toFixed(4)}`
+            + ` margin=${margin.toFixed(4)}`
+            + ` searchTime=${searchMs}ms`);
+
+        // ✅ Use effectiveMargin not hardcoded MARGIN_THRESHOLD
+        if (bestEmp &&
+            bestScore >= SIMILARITY_THRESHOLD &&
+            margin >= effectiveMargin) {
+
+            matchedResults.push({
+                name: bestEmp.name,
+                id: bestEmp.emp_id,
+                score: bestScore,
+                margin: margin,
+            });
+        }
+    }
+
+    return matchedResults;
+};
